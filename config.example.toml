@@ -1,0 +1,27 @@
+[chain]
+read_rpc_ws  = "wss://eth-mainnet.g.alchemy.com/v2/REPLACE_ME"
+read_rpc_http = ["https://eth-mainnet.g.alchemy.com/v2/REPLACE_ME"]
+
+[relays]
+private   = ["https://rpc.mevblocker.io/fast", "https://rpc.flashbots.net/fast"]
+public_fallback = "https://eth-mainnet.g.alchemy.com/v2/REPLACE_ME"
+
+[wallet]
+keystore_path = "./keys/miner.json"
+
+[mining]
+max_tip_gwei  = 3.0
+ev_min_ratio  = 1.2
+confirmations = 2
+
+[gpu]
+device_id         = 0
+threads_per_block = 256
+blocks_per_sm     = 4
+batch_per_thread  = 1024
+poll_interval_ms  = 50
+sm_count          = 144   # RTX 4090; set to your card's SM count
+
+[metrics]
+jsonl_path = "./logs/metrics.jsonl"
+stdout_hz  = 1

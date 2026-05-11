@@ -1,4 +1,5 @@
 //! hashminer — native CUDA miner for hash256 on-chain PoW token.
+pub mod config;
 pub mod error;
 pub mod state;
 pub mod rpc;
