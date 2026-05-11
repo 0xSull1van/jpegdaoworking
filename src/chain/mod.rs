@@ -40,3 +40,4 @@ pub trait ChainSource: Send + Sync + 'static {
 }
 
 pub mod challenge;
+pub mod contract;
