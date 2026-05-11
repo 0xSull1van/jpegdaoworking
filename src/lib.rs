@@ -6,3 +6,4 @@ pub mod chain;
 pub mod gpu;
 pub mod tx;
 pub mod wallet;
+pub mod metrics;
