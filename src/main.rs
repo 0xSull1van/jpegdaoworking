@@ -257,6 +257,47 @@ async fn run(config_path: PathBuf) -> anyhow::Result<()> {
         });
     }
 
+    // Heartbeat: log hashrate + chain state every 5 seconds so the operator can see
+    // the miner is alive between rare epoch-swap / hit events.
+    {
+        let grinder = grinder.clone();
+        let watcher = watcher.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // First tick fires immediately; skip it so the very first line isn't 0 H/s.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let hps = grinder.hashrate();
+                let hps_str = if hps > 1e9 {
+                    format!("{:.2} GH/s", hps / 1e9)
+                } else if hps > 1e6 {
+                    format!("{:.2} MH/s", hps / 1e6)
+                } else if hps > 1e3 {
+                    format!("{:.2} kH/s", hps / 1e3)
+                } else {
+                    format!("{:.0} H/s", hps)
+                };
+                match watcher.mining_state().await {
+                    Ok(st) => {
+                        tracing::info!(
+                            hashrate = %hps_str,
+                            era = st.era,
+                            epoch = st.epoch,
+                            blocks_left = st.epoch_blocks_left,
+                            "heartbeat"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(hashrate = %hps_str, error = %e, "heartbeat (no chain state)");
+                    }
+                }
+                metrics.emit(Event::Hashrate { hashrate_hps: hps });
+            }
+        });
+    }
+
     // Signal handling.
     let cancel2 = cancel.clone();
     tokio::spawn(async move {
