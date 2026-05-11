@@ -20,24 +20,37 @@ fn main() {
         panic!("nvcc not in PATH; install CUDA toolkit or build without --features cuda-runtime")
     });
 
-    let status = Command::new(&nvcc)
+    let output = Command::new(&nvcc)
         .args([
             "-ptx",
             "-O3",
             "-arch=compute_89",       // Ada Lovelace (RTX 40-series)
             "-Xptxas", "-O3",         // aggressive backend (PTX→SASS) optimization
             "-Xptxas", "-v",          // log register/spill counts for tuning visibility
-            "--use_fast_math",        // FP optimizations (no-op for our integer kernel, but enables some int folding too)
-            "--maxrregcount=80",      // cap registers so more blocks fit per SM (occupancy)
+            "--use_fast_math",        // FP optimizations
+            "--maxrregcount=80",      // cap registers so more blocks fit per SM
         ])
         .arg("-o")
         .arg(&out)
         .arg(&kernel)
-        .status()
+        .output()
         .expect("failed to invoke nvcc");
 
-    if !status.success() {
-        panic!("nvcc exited with {status}");
+    // Forward nvcc stderr (which carries -Xptxas -v register/spill info) as cargo warnings
+    // so they're visible during `cargo build` without needing -vv.
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        if !line.trim().is_empty() {
+            println!("cargo:warning=nvcc: {}", line);
+        }
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !line.trim().is_empty() {
+            println!("cargo:warning=nvcc: {}", line);
+        }
+    }
+
+    if !output.status.success() {
+        panic!("nvcc exited with {}", output.status);
     }
 
     println!("cargo:rustc-env=PTX_PATH={}", out.display());

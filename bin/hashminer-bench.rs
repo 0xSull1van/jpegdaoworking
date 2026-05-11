@@ -25,12 +25,10 @@ mod cuda_bench {
 
         let dur = Duration::from_secs(10);
         let start = Instant::now();
-        let mut last_counter: u64 = 0;
-        let mut last_t = Instant::now();
         // First sample after 2 seconds — let the kernel ramp up.
         std::thread::sleep(Duration::from_secs(2));
-        last_counter = rt.read_nonce_counter().expect("read counter");
-        last_t = Instant::now();
+        let mut last_counter: u64 = rt.read_nonce_counter().expect("read counter");
+        let mut last_t = Instant::now();
         while start.elapsed() < dur {
             std::thread::sleep(Duration::from_secs(1));
             let counter = rt.read_nonce_counter().expect("read counter");

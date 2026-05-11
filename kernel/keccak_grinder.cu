@@ -15,7 +15,13 @@ struct Hit { uint8_t nonce[32]; uint8_t hash[32]; uint32_t epoch_id; uint8_t _pa
 __device__ Hit d_hits[16];
 
 #ifndef BATCH_PER_THREAD
-#define BATCH_PER_THREAD 1024
+#define BATCH_PER_THREAD 8192
+#endif
+
+// How often to check d_should_stop. Higher = lower atomic overhead, slower shutdown.
+// At ~2 outer iters/sec/thread with BATCH=8192, check every 16 outers ≈ 8 sec to react.
+#ifndef STOP_CHECK_EVERY
+#define STOP_CHECK_EVERY 16
 #endif
 
 extern "C" __global__ void grind() {
@@ -26,7 +32,11 @@ extern "C" __global__ void grind() {
     const uint64_t nonce_hi    = static_cast<uint64_t>(tid);
     const uint64_t nonce_hi_bs = bswap64(nonce_hi);   // bytes 48..55 of the absorb block (state word 6)
 
-    while (atomicAdd(&d_should_stop, 0) == 0) {
+    uint32_t outer = 0;
+    while (true) {
+        if ((outer++ % STOP_CHECK_EVERY) == 0) {
+            if (atomicAdd(&d_should_stop, 0) != 0) break;
+        }
         uint32_t idx = d_active_idx;
         uint32_t my_epoch = c_epoch_id[idx];
 
