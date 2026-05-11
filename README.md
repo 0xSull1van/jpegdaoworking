@@ -18,7 +18,11 @@ Native NVIDIA CUDA miner for [hash256](https://hash256.org) — replaces the bro
 # 2. Build
 cargo build --release --features cuda-runtime
 
-# 3. Create a v3 keystore
+# 3. Create a v3 keystore (Windows / no python / no foundry)
+hashminer import-key --out ./keystore --name miner.json
+# Prompts for your private key (hidden) and an encryption password.
+# Writes an encrypted v3 keystore JSON and prints the derived address.
+# Then point config.toml at the new file.
 cp config.example.toml config.toml
 # edit config.toml: RPC URLs, keystore path
 

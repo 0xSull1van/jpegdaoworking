@@ -5,7 +5,7 @@ use hashminer::gpu::Grinder;
 use hashminer::metrics::{Event, MetricsBus};
 use hashminer::rpc;
 use hashminer::tx::{Submitter, relay::default_relays, submitter::TxSubmitter, ev_gate::EvParams};
-use hashminer::wallet::{MinerSigner, keystore::{read_password_from_env_or_prompt, unlock}};
+use hashminer::wallet::{MinerSigner, keystore::{create_keystore, read_password_from_env_or_prompt, unlock}};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
@@ -35,6 +35,15 @@ enum Cmd {
         #[arg(long, default_value = "0x0000000000000000000000000000000000000001")]
         miner: String,
     },
+    /// Import a hex private key and write an encrypted v3 keystore JSON file.
+    ImportKey {
+        /// Directory where the keystore JSON will be written.
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional fixed filename (otherwise a UUID is generated).
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -49,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => run(cli.config).await,
         Cmd::ChainWatch { rpc, miner } => chain_watch(&rpc, miner.parse()?).await,
+        Cmd::ImportKey { out, name } => import_key(out, name.as_deref()).await,
     }
 }
 
@@ -64,6 +74,39 @@ async fn chain_watch(rpc_url: &str, miner: alloy::primitives::Address) -> anyhow
             u.epoch, u.block_number, u.target, u.challenge
         );
     }
+}
+
+async fn import_key(out: PathBuf, name: Option<&str>) -> anyhow::Result<()> {
+    use zeroize::Zeroizing;
+
+    let pk_hex = Zeroizing::new(
+        rpassword::prompt_password("Private key (0x prefix optional, hidden): ")?,
+    );
+    let trimmed = pk_hex.trim_start_matches("0x").trim().to_owned();
+    let bytes_vec =
+        hex::decode(&trimmed).map_err(|e| anyhow::anyhow!("invalid hex: {e}"))?;
+    if bytes_vec.len() != 32 {
+        anyhow::bail!("private key must be 32 bytes (got {})", bytes_vec.len());
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&bytes_vec);
+    drop(bytes_vec);
+
+    let pw1 = rpassword::prompt_password("Encryption password: ")?;
+    let pw2 = rpassword::prompt_password("Confirm password: ")?;
+    if pw1 != pw2 {
+        anyhow::bail!("passwords do not match");
+    }
+    let pw = Zeroizing::new(pw1);
+    // pw2 is a plain String; drop it promptly to limit its lifetime in memory.
+    drop(pw2);
+
+    let path = create_keystore(&out, &key, &pw, name)?;
+    let signer = MinerSigner::from_key(key)?;
+    println!("Keystore written: {}", path.display());
+    println!("Derived address:  {}", signer.address());
+    println!("Save the password somewhere safe — without it the keystore is unrecoverable.");
+    Ok(())
 }
 
 async fn run(config_path: PathBuf) -> anyhow::Result<()> {
