@@ -1,0 +1,21 @@
+[Unit]
+Description=hashminer — native CUDA miner for hash256
+After=network-online.target
+
+[Service]
+Type=simple
+User=miner
+WorkingDirectory=/opt/hashminer
+EnvironmentFile=/etc/hashminer/env
+ExecStart=/opt/hashminer/hashminer --config /etc/hashminer/config.toml
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/hashminer.log
+StandardError=inherit
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/hashminer.log /opt/hashminer/logs
+
+[Install]
+WantedBy=multi-user.target
