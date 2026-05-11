@@ -28,16 +28,29 @@ fn main() {
     let arch_flag = format!("-arch={}", arch);
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
 
+    // Register cap — configurable via CUDA_MAXREG env var.
+    //   CUDA_MAXREG=64       → tight, max occupancy, may spill
+    //   CUDA_MAXREG=80       → previous default
+    //   CUDA_MAXREG=128      → loose, may reduce occupancy but no spill
+    //   CUDA_MAXREG=auto     → no cap, let compiler decide
+    //   (unset)              → default 80
+    let maxreg = std::env::var("CUDA_MAXREG").unwrap_or_else(|_| "80".to_string());
+    println!("cargo:rerun-if-env-changed=CUDA_MAXREG");
+
+    let mut args: Vec<String> = vec![
+        "-ptx".into(),
+        "-O3".into(),
+        arch_flag,
+        "-Xptxas".into(), "-O3".into(),
+        "-Xptxas".into(), "-v".into(),
+        "--use_fast_math".into(),
+    ];
+    if maxreg != "auto" {
+        args.push(format!("--maxrregcount={}", maxreg));
+    }
+
     let output = Command::new(&nvcc)
-        .args([
-            "-ptx",
-            "-O3",
-            &arch_flag,
-            "-Xptxas", "-O3",         // aggressive backend (PTX→SASS) optimization
-            "-Xptxas", "-v",          // log register/spill counts for tuning visibility
-            "--use_fast_math",        // FP optimizations
-            "--maxrregcount=80",      // cap registers so more blocks fit per SM
-        ])
+        .args(&args)
         .arg("-o")
         .arg(&out)
         .arg(&kernel)
