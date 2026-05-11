@@ -1,213 +1,184 @@
 #include "keccak_device.cuh"
-#include "result_codec.cuh"
-
-// Double-buffered challenge + target (hot-swap without kernel restart).
-__constant__ uint8_t  c_challenge[2][32];
-__constant__ uint64_t c_target[2][4];          // big-endian
-__constant__ uint32_t c_epoch_id[2];
-
-__device__ uint32_t d_active_idx;
-__device__ uint64_t d_nonce_counter;
-__device__ uint32_t d_hit_count;
-__device__ uint32_t d_should_stop;
-
-struct Hit { uint8_t nonce[32]; uint8_t hash[32]; uint32_t epoch_id; uint8_t _pad[4]; };
-__device__ Hit d_hits[16];
-
-#ifndef BATCH_PER_THREAD
-#define BATCH_PER_THREAD 8192
-#endif
-
-#ifndef STOP_CHECK_EVERY
-#define STOP_CHECK_EVERY 16
-#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fully-inlined Keccak-f[1600] with named state variables.
+// One-shot Keccak-256 mining kernel.
 //
-// Critical optimization: by operating on 25 distinct uint64_t locals (s0..s24)
-// rather than an array `uint64_t s[25]`, we guarantee no `&s` pointer is ever
-// materialised, so the compiler MUST keep state in registers (no local-memory
-// spill). Each round below expands to ~90 pure SSA operations the compiler
-// schedules freely with high ILP.
+// Each thread tries exactly ONE nonce = nonce_start + globalThreadId, then exits.
+// Host launches kernels in a loop, incrementing nonce_start by grid_size between
+// launches. This architecture matches proven high-perf miners (sha3x_cudaminer,
+// friend's reference) and avoids:
+//   • atomicAdd on a global nonce counter (every thread had to do this in the
+//     old persistent design — eliminates contention)
+//   • long-lived register state across iterations (compiler can fully optimize
+//     a one-shot thread vs an infinite outer loop)
+//   • driver scheduler depriorities on persistent kernels (observed on Blackwell)
 //
-// The 24 round constants are baked into 24 ROUND() invocations to avoid any
-// runtime constant lookup or loop branch.
+// Input layout (matches Solidity `keccak256(abi.encode(challenge, nonce))`):
+//   bytes  0..31 — challenge (32B)        → state lanes 0..3 (LE host pre-load)
+//   bytes 32..63 — nonce as uint256 BE    → state lanes 4..7
+//     (for nonces < 2^64: lanes 4,5,6 = 0; lane 7 = bswap64(nonce))
+// Padding (Keccak-256, not FIPS-202):
+//   byte 64  = 0x01  → state[8]  low byte
+//   byte 135 = 0x80  → state[16] high byte (rate = 136 bytes)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#define THETA() do {                                                          \
-    uint64_t C0 = s0 ^ s5  ^ s10 ^ s15 ^ s20;                                 \
-    uint64_t C1 = s1 ^ s6  ^ s11 ^ s16 ^ s21;                                 \
-    uint64_t C2 = s2 ^ s7  ^ s12 ^ s17 ^ s22;                                 \
-    uint64_t C3 = s3 ^ s8  ^ s13 ^ s18 ^ s23;                                 \
-    uint64_t C4 = s4 ^ s9  ^ s14 ^ s19 ^ s24;                                 \
-    uint64_t D0 = C4 ^ ROL64(C1, 1);                                          \
-    uint64_t D1 = C0 ^ ROL64(C2, 1);                                          \
-    uint64_t D2 = C1 ^ ROL64(C3, 1);                                          \
-    uint64_t D3 = C2 ^ ROL64(C4, 1);                                          \
-    uint64_t D4 = C3 ^ ROL64(C0, 1);                                          \
-    s0 ^= D0; s5  ^= D0; s10 ^= D0; s15 ^= D0; s20 ^= D0;                     \
-    s1 ^= D1; s6  ^= D1; s11 ^= D1; s16 ^= D1; s21 ^= D1;                     \
-    s2 ^= D2; s7  ^= D2; s12 ^= D2; s17 ^= D2; s22 ^= D2;                     \
-    s3 ^= D3; s8  ^= D3; s13 ^= D3; s18 ^= D3; s23 ^= D3;                     \
-    s4 ^= D4; s9  ^= D4; s14 ^= D4; s19 ^= D4; s24 ^= D4;                     \
-} while (0)
+// 24 round constants of Keccak-f[1600], stored in CUDA constant memory so the
+// L1 constant cache broadcasts them to all threads in a warp in one cycle.
+__constant__ uint64_t RC[24] = {
+    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808AULL, 0x8000000080008000ULL,
+    0x000000000000808BULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
+    0x000000000000008AULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000AULL,
+    0x000000008000808BULL, 0x800000000000008BULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
+    0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800AULL, 0x800000008000000AULL,
+    0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
+};
 
-#define RHO_PI() do {                                                         \
-    uint64_t t = s1, b;                                                       \
-    b = s10; s10 = ROL64(t,  1); t = b;                                       \
-    b = s7;  s7  = ROL64(t,  3); t = b;                                       \
-    b = s11; s11 = ROL64(t,  6); t = b;                                       \
-    b = s17; s17 = ROL64(t, 10); t = b;                                       \
-    b = s18; s18 = ROL64(t, 15); t = b;                                       \
-    b = s3;  s3  = ROL64(t, 21); t = b;                                       \
-    b = s5;  s5  = ROL64(t, 28); t = b;                                       \
-    b = s16; s16 = ROL64(t, 36); t = b;                                       \
-    b = s8;  s8  = ROL64(t, 45); t = b;                                       \
-    b = s21; s21 = ROL64(t, 55); t = b;                                       \
-    b = s24; s24 = ROL64(t,  2); t = b;                                       \
-    b = s4;  s4  = ROL64(t, 14); t = b;                                       \
-    b = s15; s15 = ROL64(t, 27); t = b;                                       \
-    b = s23; s23 = ROL64(t, 41); t = b;                                       \
-    b = s19; s19 = ROL64(t, 56); t = b;                                       \
-    b = s13; s13 = ROL64(t,  8); t = b;                                       \
-    b = s12; s12 = ROL64(t, 25); t = b;                                       \
-    b = s2;  s2  = ROL64(t, 43); t = b;                                       \
-    b = s20; s20 = ROL64(t, 62); t = b;                                       \
-    b = s14; s14 = ROL64(t, 18); t = b;                                       \
-    b = s22; s22 = ROL64(t, 39); t = b;                                       \
-    b = s9;  s9  = ROL64(t, 61); t = b;                                       \
-    b = s6;  s6  = ROL64(t, 20); t = b;                                       \
-                s1 = ROL64(t, 44);                                            \
-} while (0)
+__device__ __forceinline__ uint64_t bswap64_kernel(uint64_t x) {
+    uint32_t lo = __byte_perm((uint32_t)x,         0u, 0x0123u);
+    uint32_t hi = __byte_perm((uint32_t)(x >> 32), 0u, 0x0123u);
+    return ((uint64_t)lo << 32) | (uint64_t)hi;
+}
 
-#define CHI_ROW(a, b, c, d, e) do {                                           \
-    uint64_t t0 = a, t1 = b, t2 = c, t3 = d, t4 = e;                          \
-    a = t0 ^ ((~t1) & t2);                                                    \
-    b = t1 ^ ((~t2) & t3);                                                    \
-    c = t2 ^ ((~t3) & t4);                                                    \
-    d = t3 ^ ((~t4) & t0);                                                    \
-    e = t4 ^ ((~t0) & t1);                                                    \
-} while (0)
+__device__ __forceinline__ void keccak_f1600_arr(uint64_t* st) {
+    uint64_t bc0, bc1, bc2, bc3, bc4, t, tmp;
+    #pragma unroll
+    for (int r = 0; r < 24; r++) {
+        // Theta
+        bc0 = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
+        bc1 = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
+        bc2 = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
+        bc3 = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
+        bc4 = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
 
-#define CHI() do {                                                            \
-    CHI_ROW(s0,  s1,  s2,  s3,  s4);                                          \
-    CHI_ROW(s5,  s6,  s7,  s8,  s9);                                          \
-    CHI_ROW(s10, s11, s12, s13, s14);                                         \
-    CHI_ROW(s15, s16, s17, s18, s19);                                         \
-    CHI_ROW(s20, s21, s22, s23, s24);                                         \
-} while (0)
+        t = bc4 ^ ROL64(bc1, 1);
+        st[ 0] ^= t; st[ 5] ^= t; st[10] ^= t; st[15] ^= t; st[20] ^= t;
+        t = bc0 ^ ROL64(bc2, 1);
+        st[ 1] ^= t; st[ 6] ^= t; st[11] ^= t; st[16] ^= t; st[21] ^= t;
+        t = bc1 ^ ROL64(bc3, 1);
+        st[ 2] ^= t; st[ 7] ^= t; st[12] ^= t; st[17] ^= t; st[22] ^= t;
+        t = bc2 ^ ROL64(bc4, 1);
+        st[ 3] ^= t; st[ 8] ^= t; st[13] ^= t; st[18] ^= t; st[23] ^= t;
+        t = bc3 ^ ROL64(bc0, 1);
+        st[ 4] ^= t; st[ 9] ^= t; st[14] ^= t; st[19] ^= t; st[24] ^= t;
 
-#define ROUND(rc) do { THETA(); RHO_PI(); CHI(); s0 ^= (rc); } while (0)
+        // Rho + Pi (standard chain 1→10→7→11→…→6→1, 24 lane rotations)
+        t = st[1];
+        tmp = st[10]; st[10] = ROL64(t,  1); t = tmp;
+        tmp = st[ 7]; st[ 7] = ROL64(t,  3); t = tmp;
+        tmp = st[11]; st[11] = ROL64(t,  6); t = tmp;
+        tmp = st[17]; st[17] = ROL64(t, 10); t = tmp;
+        tmp = st[18]; st[18] = ROL64(t, 15); t = tmp;
+        tmp = st[ 3]; st[ 3] = ROL64(t, 21); t = tmp;
+        tmp = st[ 5]; st[ 5] = ROL64(t, 28); t = tmp;
+        tmp = st[16]; st[16] = ROL64(t, 36); t = tmp;
+        tmp = st[ 8]; st[ 8] = ROL64(t, 45); t = tmp;
+        tmp = st[21]; st[21] = ROL64(t, 55); t = tmp;
+        tmp = st[24]; st[24] = ROL64(t,  2); t = tmp;
+        tmp = st[ 4]; st[ 4] = ROL64(t, 14); t = tmp;
+        tmp = st[15]; st[15] = ROL64(t, 27); t = tmp;
+        tmp = st[23]; st[23] = ROL64(t, 41); t = tmp;
+        tmp = st[19]; st[19] = ROL64(t, 56); t = tmp;
+        tmp = st[13]; st[13] = ROL64(t,  8); t = tmp;
+        tmp = st[12]; st[12] = ROL64(t, 25); t = tmp;
+        tmp = st[ 2]; st[ 2] = ROL64(t, 43); t = tmp;
+        tmp = st[20]; st[20] = ROL64(t, 62); t = tmp;
+        tmp = st[14]; st[14] = ROL64(t, 18); t = tmp;
+        tmp = st[22]; st[22] = ROL64(t, 39); t = tmp;
+        tmp = st[ 9]; st[ 9] = ROL64(t, 61); t = tmp;
+        tmp = st[ 6]; st[ 6] = ROL64(t, 20); t = tmp;
+        st[1] = ROL64(t, 44);
 
-extern "C" __global__ void grind() {
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t base = atomicAdd((unsigned long long*)&d_nonce_counter, (unsigned long long)BATCH_PER_THREAD);
+        // Chi (5 rows of 5 lanes each)
+        bc0 = st[ 0]; bc1 = st[ 1]; bc2 = st[ 2]; bc3 = st[ 3]; bc4 = st[ 4];
+        st[ 0] = bc0 ^ ((~bc1) & bc2); st[ 1] = bc1 ^ ((~bc2) & bc3); st[ 2] = bc2 ^ ((~bc3) & bc4);
+        st[ 3] = bc3 ^ ((~bc4) & bc0); st[ 4] = bc4 ^ ((~bc0) & bc1);
 
-    // tid is constant per thread → bswap once.
-    const uint64_t nonce_hi    = static_cast<uint64_t>(tid);
-    const uint64_t nonce_hi_bs = bswap64(nonce_hi);
+        bc0 = st[ 5]; bc1 = st[ 6]; bc2 = st[ 7]; bc3 = st[ 8]; bc4 = st[ 9];
+        st[ 5] = bc0 ^ ((~bc1) & bc2); st[ 6] = bc1 ^ ((~bc2) & bc3); st[ 7] = bc2 ^ ((~bc3) & bc4);
+        st[ 8] = bc3 ^ ((~bc4) & bc0); st[ 9] = bc4 ^ ((~bc0) & bc1);
 
-    uint32_t outer = 0;
-    while (true) {
-        if ((outer++ % STOP_CHECK_EVERY) == 0) {
-            if (atomicAdd(&d_should_stop, 0) != 0) break;
-        }
-        const uint32_t idx = d_active_idx;
-        const uint32_t my_epoch = c_epoch_id[idx];
+        bc0 = st[10]; bc1 = st[11]; bc2 = st[12]; bc3 = st[13]; bc4 = st[14];
+        st[10] = bc0 ^ ((~bc1) & bc2); st[11] = bc1 ^ ((~bc2) & bc3); st[12] = bc2 ^ ((~bc3) & bc4);
+        st[13] = bc3 ^ ((~bc4) & bc0); st[14] = bc4 ^ ((~bc0) & bc1);
 
-        // Pre-compute bswapped challenge words for this batch.
-        const uint64_t* challenge_w = reinterpret_cast<const uint64_t*>(c_challenge[idx]);
-        const uint64_t ch0 = bswap64(challenge_w[0]);
-        const uint64_t ch1 = bswap64(challenge_w[1]);
-        const uint64_t ch2 = bswap64(challenge_w[2]);
-        const uint64_t ch3 = bswap64(challenge_w[3]);
+        bc0 = st[15]; bc1 = st[16]; bc2 = st[17]; bc3 = st[18]; bc4 = st[19];
+        st[15] = bc0 ^ ((~bc1) & bc2); st[16] = bc1 ^ ((~bc2) & bc3); st[17] = bc2 ^ ((~bc3) & bc4);
+        st[18] = bc3 ^ ((~bc4) & bc0); st[19] = bc4 ^ ((~bc0) & bc1);
 
-        // Target words for comparison (already native u64 BE in c_target).
-        const uint64_t t0 = c_target[idx][0];
-        const uint64_t t1 = c_target[idx][1];
-        const uint64_t t2 = c_target[idx][2];
-        const uint64_t t3 = c_target[idx][3];
+        bc0 = st[20]; bc1 = st[21]; bc2 = st[22]; bc3 = st[23]; bc4 = st[24];
+        st[20] = bc0 ^ ((~bc1) & bc2); st[21] = bc1 ^ ((~bc2) & bc3); st[22] = bc2 ^ ((~bc3) & bc4);
+        st[23] = bc3 ^ ((~bc4) & bc0); st[24] = bc4 ^ ((~bc0) & bc1);
 
-        #pragma unroll 1
-        for (uint32_t i = 0; i < BATCH_PER_THREAD; i++) {
-            // ─── Initialize sponge state directly in registers ──────────────
-            // Absorb 64-byte input: [challenge(32B) | nonce_BE(32B)]
-            //   bytes  0..31 = challenge (s0..s3 after bswap)
-            //   bytes 32..47 = 0          (s4=s5=0)
-            //   bytes 48..55 = nonce_hi BE (s6)
-            //   bytes 56..63 = nonce_lo BE (s7)
-            // Padding (Keccak-256, not FIPS-202):
-            //   byte  64 = 0x01 → LSB of s8
-            //   byte 135 = 0x80 → MSB of s16
-            uint64_t s0 = ch0;
-            uint64_t s1 = ch1;
-            uint64_t s2 = ch2;
-            uint64_t s3 = ch3;
-            uint64_t s4 = 0;
-            uint64_t s5 = 0;
-            uint64_t s6 = nonce_hi_bs;
-            const uint64_t nonce_lo = base + i;
-            uint64_t s7 = bswap64(nonce_lo);
-            uint64_t s8 = 0x0000000000000001ULL;
-            uint64_t s9 = 0, s10 = 0, s11 = 0, s12 = 0, s13 = 0, s14 = 0, s15 = 0;
-            uint64_t s16 = 0x8000000000000000ULL;
-            uint64_t s17 = 0, s18 = 0, s19 = 0, s20 = 0, s21 = 0, s22 = 0, s23 = 0, s24 = 0;
+        // Iota
+        st[0] ^= RC[r];
+    }
+}
 
-            // ─── 24 rounds of Keccak-f[1600], fully unrolled ────────────────
-            ROUND(0x0000000000000001ULL);
-            ROUND(0x0000000000008082ULL);
-            ROUND(0x800000000000808AULL);
-            ROUND(0x8000000080008000ULL);
-            ROUND(0x000000000000808BULL);
-            ROUND(0x0000000080000001ULL);
-            ROUND(0x8000000080008081ULL);
-            ROUND(0x8000000000008009ULL);
-            ROUND(0x000000000000008AULL);
-            ROUND(0x0000000000000088ULL);
-            ROUND(0x0000000080008009ULL);
-            ROUND(0x000000008000000AULL);
-            ROUND(0x000000008000808BULL);
-            ROUND(0x800000000000008BULL);
-            ROUND(0x8000000000008089ULL);
-            ROUND(0x8000000000008003ULL);
-            ROUND(0x8000000000008002ULL);
-            ROUND(0x8000000000000080ULL);
-            ROUND(0x000000000000800AULL);
-            ROUND(0x800000008000000AULL);
-            ROUND(0x8000000080008081ULL);
-            ROUND(0x8000000000008080ULL);
-            ROUND(0x0000000080000001ULL);
-            ROUND(0x8000000080008008ULL);
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel entry point.
+//
+// Args:
+//   challenge[4]  — keccak state lanes 0..3 (LE uint64, pre-loaded by host)
+//   nonce_start   — base nonce for this launch (host increments by grid_size)
+//   target[4]     — difficulty as 4 BE uint64 (target[0] = MSB)
+//   result        — winning nonce written here (atomic, first winner wins)
+//   found         — atomic flag: 0 = not found, 1 = found
+// ─────────────────────────────────────────────────────────────────────────────
+extern "C" __global__ void mine(
+    const uint64_t* __restrict__ challenge,
+    uint64_t                     nonce_start,
+    const uint64_t* __restrict__ target,
+    uint64_t*                    result,
+    int*                         found
+) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
-            // ─── Output: first 32 bytes of state, big-endian comparison ─────
-            const uint64_t h0 = bswap64(s0);
-            const uint64_t h1 = bswap64(s1);
-            const uint64_t h2 = bswap64(s2);
-            const uint64_t h3 = bswap64(s3);
-            bool hit;
-            if      (h0 != t0) hit = h0 < t0;
-            else if (h1 != t1) hit = h1 < t1;
-            else if (h2 != t2) hit = h2 < t2;
-            else               hit = h3 < t3;
+    // Early-out if another thread already found a solution in this launch.
+    // *found is a regular global load (cached in L1); cheap.
+    if (*found) return;
 
-            if (hit) {
-                const uint32_t slot = atomicAdd(&d_hit_count, 1);
-                if (slot < 16) {
-                    uint64_t* out = reinterpret_cast<uint64_t*>(d_hits[slot].nonce);
-                    out[0] = 0;
-                    out[1] = 0;
-                    out[2] = nonce_hi_bs;
-                    out[3] = bswap64(nonce_lo);
-                    uint64_t* hash_out = reinterpret_cast<uint64_t*>(d_hits[slot].hash);
-                    hash_out[0] = h0;
-                    hash_out[1] = h1;
-                    hash_out[2] = h2;
-                    hash_out[3] = h3;
-                    d_hits[slot].epoch_id = my_epoch;
-                }
-            }
-        }
-        base = atomicAdd((unsigned long long*)&d_nonce_counter, (unsigned long long)BATCH_PER_THREAD);
+    uint64_t nonce = nonce_start + gid;
+
+    // Build initial sponge state for this nonce.
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; i++) st[i] = 0ULL;
+
+    // Absorb 32-byte challenge into lanes 0..3 (host pre-converted to LE uint64).
+    st[0] = challenge[0];
+    st[1] = challenge[1];
+    st[2] = challenge[2];
+    st[3] = challenge[3];
+
+    // Absorb 32-byte big-endian nonce into lanes 4..7.
+    // For nonces < 2^64: lanes 4, 5, 6 = 0; lane 7 = nonce as LE-interpreted BE bytes.
+    st[7] = bswap64_kernel(nonce);
+
+    // Keccak-256 padding (rate = 136 bytes after 64-byte input):
+    //   byte 64  = 0x01  → low byte of state[8]
+    //   byte 135 = 0x80  → high byte of state[16]
+    st[8]  = 0x0000000000000001ULL;
+    st[16] = 0x8000000000000000ULL;
+
+    keccak_f1600_arr(st);
+
+    // Output: first 32 bytes of state, compared big-endian against target.
+    uint64_t h0 = bswap64_kernel(st[0]);
+    uint64_t h1 = bswap64_kernel(st[1]);
+    uint64_t h2 = bswap64_kernel(st[2]);
+    uint64_t h3 = bswap64_kernel(st[3]);
+
+    uint64_t d0 = target[0];
+    uint64_t d1 = target[1];
+    uint64_t d2 = target[2];
+    uint64_t d3 = target[3];
+
+    bool less = (h0 <  d0) ||
+                (h0 == d0 && h1 <  d1) ||
+                (h0 == d0 && h1 == d1 && h2 <  d2) ||
+                (h0 == d0 && h1 == d1 && h2 == d2 && h3 <  d3);
+
+    if (less && atomicCAS(found, 0, 1) == 0) {
+        *result = nonce;
     }
 }

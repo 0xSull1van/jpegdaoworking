@@ -39,9 +39,19 @@ pub struct MiningCfg {
 #[derive(Debug, Deserialize, Clone)]
 pub struct GpuCfg {
     pub device_id: u32,
+    /// Threads per block (block_size). Typical: 256.
     pub threads_per_block: u32,
+    /// Total nonces per kernel launch (must divide evenly by threads_per_block).
+    /// Suggested: 256M for 1-2 GH/s cards, 1G for RTX 5090.
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u64,
+
+    // ── Legacy/unused fields (kept for backwards-compat with existing configs) ──
+    #[serde(default)]
     pub blocks_per_sm: u32,
+    #[serde(default)]
     pub batch_per_thread: u32,
+    #[serde(default)]
     pub poll_interval_ms: u64,
     #[serde(default = "default_sms")]
     pub sm_count: u32,
@@ -49,6 +59,10 @@ pub struct GpuCfg {
 
 fn default_sms() -> u32 {
     144 // RTX 4090
+}
+
+fn default_batch_size() -> u64 {
+    268_435_456 // 256M — works well for 1-2 GH/s cards. RTX 5090 should override to 1G or 2G.
 }
 
 #[derive(Debug, Deserialize, Clone)]

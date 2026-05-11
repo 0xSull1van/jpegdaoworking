@@ -181,7 +181,7 @@ async fn run(
     let grinder: Arc<dyn Grinder> = Arc::new(
         hashminer::gpu::worker::GpuWorker::start(
             cfg.gpu.device_id,
-            cfg.gpu.blocks_per_sm * cfg.gpu.sm_count,
+            cfg.gpu.batch_size,
             cfg.gpu.threads_per_block,
             cfg.gpu.poll_interval_ms,
         )

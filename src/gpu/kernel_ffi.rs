@@ -1,70 +1,59 @@
 // CUDA runtime FFI via cudarc 0.19.
 //
-// Adaptation notes (cudarc 0.19 vs the plan's assumed 0.12 API):
+// One-shot mining kernel architecture:
+//   • Each kernel launch processes a fixed grid of work-items (BATCH_SIZE).
+//   • Each thread computes EXACTLY ONE keccak hash for nonce = nonce_start + gid.
+//   • If a thread finds a valid hash, it sets `found = 1` via atomicCAS and
+//     writes the winning nonce to `result`. Other threads see `found=1` on entry
+//     and exit immediately.
+//   • Host launches kernels in a loop, incrementing nonce_start by BATCH_SIZE
+//     between launches and reading the result/found flags after each sync.
 //
-// • API renamed: CudaDevice → CudaContext; no device.load_ptx/get_func.
-// • `CudaContext::load_module` is gated on the `nvrtc` feature — we enable it.
-//   The NVRTC compiler itself is only dlopen'd at runtime, so compile-time
-//   success does not require nvcc on the build host.
-// • `cuda-12030` feature selects the CUDA 12.3 ABI (CI host must have CUDA ≥12.3).
-// • With `fallback-dynamic-loading` the CUDA driver is also dlopen'd at runtime,
-//   meaning `cargo check --features cuda-runtime` succeeds without a CUDA install.
-// • `CudaModule::cu_module` is `pub(crate)`, so we cannot touch it directly.
-//   We call `module.get_global(name, &stream)` for symbol access and use
-//   `stream.memcpy_htod` / `stream.memcpy_dtoh` for all device ↔ host transfers.
-//   For double-buffer offset writes we use `CudaViewMut::try_slice_mut`.
-// • `CudaFunction` is `Clone` in 0.19 — no `Mutex` needed.
-// • The `grind` kernel takes no Rust-side arguments (all state lives in
-//   `__device__` globals), so `launch_builder` is used with zero `.arg()` calls.
-// • `CudaContext::default_stream()` is infallible in 0.19.
+// Why this design (vs the previous persistent kernel):
+//   • No global atomic on a shared nonce counter — every thread derives its
+//     unique nonce from gid implicitly.
+//   • Compiler optimises a one-shot thread far better than an infinite outer
+//     loop with hold-live state across iterations.
+//   • Driver scheduling depriorities of long-running kernels (observed on
+//     Blackwell sm_120) no longer apply.
+//
+// All kernel args are passed by reference per launch — no `__device__` globals
+// are used in this kernel. Buffers are allocated once in `init`.
 
 #![cfg(feature = "cuda-runtime")]
 
 use crate::error::{MinerError, Result};
 use crate::gpu::ptx::PTX;
-use crate::gpu::Hit;
 use alloy::primitives::{B256, U256};
 use cudarc::driver::{
-    safe::{CudaContext, CudaFunction, CudaModule, CudaStream},
+    safe::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, PushKernelArg},
     LaunchConfig,
 };
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
-// ─── Raw layout matching the CUDA kernel's HitRecord struct ──────────────────
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct HitRaw {
-    nonce: [u8; 32],
-    hash: [u8; 32],
-    epoch_id: u32,
-    _pad: [u8; 4],
-}
-
-// ─── GpuRuntime ──────────────────────────────────────────────────────────────
-
 pub struct GpuRuntime {
     pub context: Arc<CudaContext>,
-    /// Control stream — used for all host↔device memcpy. Does NOT block behind the
-    /// persistent kernel. Must be separate from compute_stream.
     pub stream: Arc<CudaStream>,
-    /// Dedicated stream for the persistent grind kernel. The kernel may run forever;
-    /// queueing memcpy on this stream would deadlock waiting for the kernel to finish.
-    compute_stream: Arc<CudaStream>,
+    #[allow(dead_code)]
     module: Arc<CudaModule>,
-    grind_fn: CudaFunction,
-    /// Host mirror of which double-buffer slot is live on the device.
-    active_idx_host: u32,
+    mine_fn: CudaFunction,
+
+    // Device buffers — allocated once, reused for every launch.
+    challenge_buf: CudaSlice<u64>, // 4 lanes, LE-interpreted (state lanes 0..3 raw)
+    target_buf: CudaSlice<u64>,    // 4 lanes, big-endian (target[0] = MSB)
+    result_buf: CudaSlice<u64>,    // 1 element — winning nonce
+    found_buf: CudaSlice<i32>,     // 1 element — atomic flag
+
+    // Host-side cache of the active epoch id (for tagging Hit events).
+    pub epoch_id_host: u32,
 }
 
 impl GpuRuntime {
-    /// Initialise context, load PTX, resolve kernel function.
     pub fn init(device_id: u32) -> Result<Self> {
         let context = CudaContext::new(device_id as usize)
             .map_err(|e| MinerError::Gpu(format!("CudaContext::new: {e:?}")))?;
 
-        // PTX bytes are a UTF-8 null-terminated string produced by nvcc.
         let ptx_str = std::str::from_utf8(PTX)
             .map_err(|_| MinerError::Gpu("PTX is not valid UTF-8".into()))?;
 
@@ -72,293 +61,141 @@ impl GpuRuntime {
             .load_module(Ptx::from_src(ptx_str))
             .map_err(|e| MinerError::Gpu(format!("load_module: {e:?}")))?;
 
-        let grind_fn: CudaFunction = module
-            .load_function("grind")
-            .map_err(|e| MinerError::Gpu(format!("load_function(grind): {e:?}")))?;
+        let mine_fn: CudaFunction = module
+            .load_function("mine")
+            .map_err(|e| MinerError::Gpu(format!("load_function(mine): {e:?}")))?;
 
         let stream = context.default_stream();
-        let compute_stream = context
-            .new_stream()
-            .map_err(|e| MinerError::Gpu(format!("new_stream(compute): {e:?}")))?;
+
+        // Pre-allocate the small fixed-size device buffers.
+        let challenge_buf = stream
+            .alloc_zeros::<u64>(4)
+            .map_err(|e| MinerError::Gpu(format!("alloc challenge_buf: {e:?}")))?;
+        let target_buf = stream
+            .alloc_zeros::<u64>(4)
+            .map_err(|e| MinerError::Gpu(format!("alloc target_buf: {e:?}")))?;
+        let result_buf = stream
+            .alloc_zeros::<u64>(1)
+            .map_err(|e| MinerError::Gpu(format!("alloc result_buf: {e:?}")))?;
+        let found_buf = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| MinerError::Gpu(format!("alloc found_buf: {e:?}")))?;
 
         Ok(Self {
             context,
             stream,
-            compute_stream,
             module,
-            grind_fn,
-            active_idx_host: 0,
+            mine_fn,
+            challenge_buf,
+            target_buf,
+            result_buf,
+            found_buf,
+            epoch_id_host: 0,
         })
     }
 
-    /// Swap to new mining parameters without restarting the kernel.
+    /// Update challenge + target on the device for upcoming launches.
+    /// Safe to call between launches; in flight launch uses whatever was set
+    /// when it was queued.
     ///
-    /// Writes into the inactive double-buffer slot, then flips `d_active_idx`.
+    /// `challenge` is the 32-byte raw keccak256 challenge; interpreted as 4 LE
+    /// uint64 lanes (matching `st[0..3] = challenge[0..3]` in the kernel).
+    /// `target` is the 256-bit difficulty, stored as 4 BE u64 (target[0] = MSB).
     pub fn hot_swap(&mut self, challenge: B256, target: U256, epoch_id: u32) -> Result<()> {
-        let next = 1u32 - self.active_idx_host;
+        // Challenge → 4 LE u64 lanes from the raw 32-byte challenge.
+        let cb: [u8; 32] = challenge.0;
+        let challenge_lanes: [u64; 4] = [
+            u64::from_le_bytes(cb[0..8].try_into().unwrap()),
+            u64::from_le_bytes(cb[8..16].try_into().unwrap()),
+            u64::from_le_bytes(cb[16..24].try_into().unwrap()),
+            u64::from_le_bytes(cb[24..32].try_into().unwrap()),
+        ];
 
-        // target → 4 × u64 big-endian (matches the kernel's u64[4] layout).
-        let bytes = target.to_be_bytes::<32>();
-        let target_words_bytes: [u8; 32] = unsafe {
-            // SAFETY: target_words is plain [u64; 4] with no pointer/padding;
-            // we transmute it to bytes for the device copy.
-            let words: [u64; 4] = [
-                u64::from_be_bytes(bytes[0..8].try_into().unwrap()),
-                u64::from_be_bytes(bytes[8..16].try_into().unwrap()),
-                u64::from_be_bytes(bytes[16..24].try_into().unwrap()),
-                u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
-            ];
-            std::mem::transmute(words)
-        };
-        let challenge_bytes: [u8; 32] = challenge.0;
-        let epoch_bytes: [u8; 4] = epoch_id.to_ne_bytes();
+        // Target → 4 BE u64 lanes (most-significant first).
+        let tb = target.to_be_bytes::<32>();
+        let target_lanes: [u64; 4] = [
+            u64::from_be_bytes(tb[0..8].try_into().unwrap()),
+            u64::from_be_bytes(tb[8..16].try_into().unwrap()),
+            u64::from_be_bytes(tb[16..24].try_into().unwrap()),
+            u64::from_be_bytes(tb[24..32].try_into().unwrap()),
+        ];
 
-        let slot_off_32 = (next as usize) * 32;
-        let slot_off_4 = (next as usize) * 4;
+        self.stream
+            .memcpy_htod(&challenge_lanes, &mut self.challenge_buf)
+            .map_err(|e| MinerError::Gpu(format!("htod challenge: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&target_lanes, &mut self.target_buf)
+            .map_err(|e| MinerError::Gpu(format!("htod target: {e:?}")))?;
+        self.epoch_id_host = epoch_id;
 
-        // c_challenge[next] = challenge
-        {
-            let mut sym = self
-                .module
-                .get_global("c_challenge", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(c_challenge): {e:?}")))?;
-            let mut slot = sym
-                .try_slice_mut(slot_off_32..slot_off_32 + 32)
-                .ok_or_else(|| MinerError::Gpu("c_challenge slice OOB".into()))?;
-            self.stream
-                .memcpy_htod(&challenge_bytes, &mut slot)
-                .map_err(|e| MinerError::Gpu(format!("htod c_challenge: {e:?}")))?;
-        }
-        // c_target[next] = target (as bytes)
-        {
-            let mut sym = self
-                .module
-                .get_global("c_target", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(c_target): {e:?}")))?;
-            let mut slot = sym
-                .try_slice_mut(slot_off_32..slot_off_32 + 32)
-                .ok_or_else(|| MinerError::Gpu("c_target slice OOB".into()))?;
-            self.stream
-                .memcpy_htod(&target_words_bytes, &mut slot)
-                .map_err(|e| MinerError::Gpu(format!("htod c_target: {e:?}")))?;
-        }
-        // c_epoch_id[next] = epoch_id
-        {
-            let mut sym = self
-                .module
-                .get_global("c_epoch_id", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(c_epoch_id): {e:?}")))?;
-            let mut slot = sym
-                .try_slice_mut(slot_off_4..slot_off_4 + 4)
-                .ok_or_else(|| MinerError::Gpu("c_epoch_id slice OOB".into()))?;
-            self.stream
-                .memcpy_htod(&epoch_bytes, &mut slot)
-                .map_err(|e| MinerError::Gpu(format!("htod c_epoch_id: {e:?}")))?;
-        }
-        // flip active index
-        {
-            let mut sym = self
-                .module
-                .get_global("d_active_idx", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_active_idx): {e:?}")))?;
-            let next_bytes: [u8; 4] = next.to_ne_bytes();
-            self.stream
-                .memcpy_htod(&next_bytes, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_active_idx: {e:?}")))?;
-        }
-        // reset hit counter (nonce counter is intentionally left alone)
-        {
-            let mut sym = self
-                .module
-                .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e:?}")))?;
-            let zero: [u8; 4] = 0u32.to_ne_bytes();
-            self.stream
-                .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count: {e:?}")))?;
-        }
-
-        self.active_idx_host = next;
-        // Ensure all writes to constant memory + d_active_idx are committed before
-        // returning. Without this, a subsequent launch_persistent on compute_stream
-        // could start the kernel before the writes land on device.
+        // Sync to ensure the writes land before any subsequent launch sees them.
         self.stream
             .synchronize()
             .map_err(|e| MinerError::Gpu(format!("hot_swap sync: {e:?}")))?;
         Ok(())
     }
 
-    /// Set the stop flag so the persistent kernel exits its polling loop.
-    pub fn signal_stop(&self) -> Result<()> {
-        let mut sym = self
-            .module
-            .get_global("d_should_stop", &self.stream)
-            .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e:?}")))?;
-        let one: [u8; 4] = 1u32.to_ne_bytes();
-        self.stream
-            .memcpy_htod(&one, &mut sym)
-            .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e:?}")))
-    }
-
-    /// Launch the persistent `grind` kernel asynchronously on the compute stream.
+    /// Launch the mine kernel for one batch of nonces starting at `nonce_start`.
+    /// Returns Ok(Some(nonce)) if a solution was found this launch, Ok(None) otherwise.
     ///
-    /// The kernel runs until `d_should_stop` is set to 1. Critically, the kernel
-    /// is queued on `compute_stream` (NOT the default/control stream) so that
-    /// subsequent control-stream memcpy operations do not block waiting for it.
-    pub fn launch_persistent(&self, blocks: u32, threads: u32) -> Result<()> {
+    /// `batch_size` is the total number of work-items spawned (grid * block).
+    /// `block_size` is threads per block (must divide batch_size; typical 256).
+    pub fn launch_mine(
+        &mut self,
+        nonce_start: u64,
+        batch_size: u64,
+        block_size: u32,
+    ) -> Result<Option<u64>> {
+        // Reset found + result buffers.
+        let zero_i32: [i32; 1] = [0];
+        let zero_u64: [u64; 1] = [0];
+        self.stream
+            .memcpy_htod(&zero_i32, &mut self.found_buf)
+            .map_err(|e| MinerError::Gpu(format!("reset found: {e:?}")))?;
+        self.stream
+            .memcpy_htod(&zero_u64, &mut self.result_buf)
+            .map_err(|e| MinerError::Gpu(format!("reset result: {e:?}")))?;
+
+        // Grid dimensions. CUDA's grid_dim.x max ≈ 2^31 - 1, so grid_count fits
+        // comfortably for any reasonable batch_size.
+        let grid_count: u32 = (batch_size / block_size as u64) as u32;
         let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
+            grid_dim: (grid_count, 1, 1),
+            block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
         };
+
         unsafe {
-            self.compute_stream
-                .launch_builder(&self.grind_fn)
+            let mut builder = self.stream.launch_builder(&self.mine_fn);
+            builder
+                .arg(&self.challenge_buf)
+                .arg(&nonce_start)
+                .arg(&self.target_buf)
+                .arg(&mut self.result_buf)
+                .arg(&mut self.found_buf);
+            builder
                 .launch(cfg)
-                .map_err(|e| MinerError::Gpu(format!("launch grind: {e:?}")))?;
-        }
-        Ok(())
-    }
-
-    /// Drain hits that have accumulated in device memory since the last call.
-    pub fn poll_hits(&mut self) -> Result<Vec<Hit>> {
-        let count: u32 = {
-            let sym = self
-                .module
-                .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e:?}")))?;
-            let mut buf = [0u8; 4];
-            self.stream
-                .memcpy_dtoh(&sym, &mut buf)
-                .map_err(|e| MinerError::Gpu(format!("dtoh d_hit_count: {e:?}")))?;
-            u32::from_ne_bytes(buf)
-        };
-        if count == 0 {
-            return Ok(Vec::new());
+                .map_err(|e| MinerError::Gpu(format!("launch mine: {e:?}")))?;
         }
 
-        let n = (count as usize).min(16);
-        let byte_len = n * std::mem::size_of::<HitRaw>();
-
-        let hits_bytes: Vec<u8> = {
-            let sym = self
-                .module
-                .get_global("d_hits", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hits): {e:?}")))?;
-            let view = sym
-                .try_slice(..byte_len)
-                .ok_or_else(|| MinerError::Gpu("d_hits slice OOB".into()))?;
-            let mut buf = vec![0u8; byte_len];
-            self.stream
-                .memcpy_dtoh(&view, &mut buf)
-                .map_err(|e| MinerError::Gpu(format!("dtoh d_hits: {e:?}")))?;
-            buf
-        };
-
-        // Reset the device counter so the ring-buffer slots can be reused.
-        {
-            let mut sym = self
-                .module
-                .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count) reset: {e:?}")))?;
-            let zero: [u8; 4] = 0u32.to_ne_bytes();
-            self.stream
-                .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e:?}")))?;
-        }
-
-        // SAFETY: HitRaw is repr(C); all fields are plain integer arrays.
-        let raw_hits: Vec<HitRaw> = {
-            let mut out = Vec::with_capacity(n);
-            unsafe {
-                let src = hits_bytes.as_ptr().cast::<HitRaw>();
-                for i in 0..n {
-                    out.push(std::ptr::read_unaligned(src.add(i)));
-                }
-            }
-            out
-        };
-
-        Ok(raw_hits
-            .into_iter()
-            .map(|r| Hit {
-                nonce: U256::from_be_bytes(r.nonce),
-                hash: B256::from(r.hash),
-                epoch_id: u64::from(r.epoch_id),
-            })
-            .collect())
-    }
-
-    /// Read the global nonce counter (for hash-rate estimation).
-    pub fn read_nonce_counter(&self) -> Result<u64> {
-        let sym = self
-            .module
-            .get_global("d_nonce_counter", &self.stream)
-            .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e:?}")))?;
-        let mut buf = [0u8; 8];
+        // Wait for kernel completion + read result.
         self.stream
-            .memcpy_dtoh(&sym, &mut buf)
-            .map_err(|e| MinerError::Gpu(format!("dtoh d_nonce_counter: {e:?}")))?;
-        Ok(u64::from_ne_bytes(buf))
-    }
+            .synchronize()
+            .map_err(|e| MinerError::Gpu(format!("launch sync: {e:?}")))?;
 
-    /// Test helper: pre-seed `d_nonce_counter` so the next batch starts at `nonce.low_u64()`,
-    /// resets stop/hit flags, then launches a 1-block × 1-thread grid.
-    /// The kernel will grind BATCH_PER_THREAD nonces from that starting point then exit.
-    pub fn force_test_nonce(&mut self, nonce: U256) -> Result<()> {
-        let counter: u64 = u64::try_from(nonce).unwrap_or(u64::MAX);
+        let mut found_h: [i32; 1] = [0];
+        self.stream
+            .memcpy_dtoh(&self.found_buf, &mut found_h)
+            .map_err(|e| MinerError::Gpu(format!("dtoh found: {e:?}")))?;
 
-        // Reset d_should_stop = 0
-        {
-            let mut sym = self
-                .module
-                .get_global("d_should_stop", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e:?}")))?;
-            let zero: [u8; 4] = 0u32.to_ne_bytes();
+        if found_h[0] != 0 {
+            let mut result_h: [u64; 1] = [0];
             self.stream
-                .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e:?}")))?;
-        }
-        // Reset d_hit_count = 0
-        {
-            let mut sym = self
-                .module
-                .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e:?}")))?;
-            let zero: [u8; 4] = 0u32.to_ne_bytes();
-            self.stream
-                .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e:?}")))?;
-        }
-        // Set d_nonce_counter = counter
-        {
-            let mut sym = self
-                .module
-                .get_global("d_nonce_counter", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e:?}")))?;
-            let bytes: [u8; 8] = counter.to_ne_bytes();
-            self.stream
-                .memcpy_htod(&bytes, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_nonce_counter: {e:?}")))?;
-        }
-        // Launch 1 block × 1 thread; kernel will grind its batch then check stop flag.
-        self.launch_persistent(1, 1)?;
-        // Signal stop so kernel exits after its first batch.
-        self.signal_stop()
-    }
-
-    /// Blocking poll: retry `poll_hits` until at least one hit is returned or `timeout` elapses.
-    pub fn poll_hits_blocking(&mut self, timeout: std::time::Duration) -> Result<Vec<Hit>> {
-        let start = std::time::Instant::now();
-        loop {
-            let hits = self.poll_hits()?;
-            if !hits.is_empty() {
-                return Ok(hits);
-            }
-            if start.elapsed() >= timeout {
-                return Ok(Vec::new());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+                .memcpy_dtoh(&self.result_buf, &mut result_h)
+                .map_err(|e| MinerError::Gpu(format!("dtoh result: {e:?}")))?;
+            Ok(Some(result_h[0]))
+        } else {
+            Ok(None)
         }
     }
 }

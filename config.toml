@@ -20,19 +20,10 @@ confirmations = 2
 [gpu]
 device_id         = 0
 threads_per_block = 256
-# Total nonces per kernel launch. Must divide evenly by threads_per_block.
-# Suggested values:
-#   RTX 4060 Ti / 3060 Ti / 4070  : 268435456    (256M, ~180ms per launch)
-#   RTX 4080 / 4090               : 536870912    (512M, ~80ms on 4090)
-#   RTX 5080 / 5090               : 1073741824   (1G,   ~180ms on 5090)
-# Higher batch = lower launch overhead but worse Ctrl+C responsiveness.
-batch_size        = 268435456
-
-# Legacy fields (kept for backward-compat; not used by current kernel).
-sm_count          = 34
-blocks_per_sm     = 4
-batch_per_thread  = 8192
+blocks_per_sm     = 4      # 34 × 4 = 136 blocks × 256 threads = 34,816 concurrent grinders
+batch_per_thread  = 1024   # each thread processes 1024 nonces per outer iter (~10ms per batch on 4060 Ti)
 poll_interval_ms  = 50
+sm_count          = 34     # RTX 4060 Ti 16GB (AD106). Other Ada: 4090=128, 4080=76, 4070 Ti=60, 4070=46. Ampere: 3090=82, 3080=68.
 
 [metrics]
 jsonl_path = "./logs/metrics.jsonl"
