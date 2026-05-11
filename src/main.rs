@@ -25,7 +25,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the miner with the configured wallet against mainnet (or wherever the RPC points).
-    Run,
+    Run {
+        /// Test mode: override the real on-chain target with this hex value.
+        /// Use this to force fast hits and verify the full submit pipeline
+        /// (sign → relay → tx → receipt) without waiting hours for a real hit.
+        /// On-chain the tx will revert with `InsufficientWork` (expected — your
+        /// real hash won't satisfy the actual difficulty). Cost ≈ $0.5 in gas
+        /// per test tx. Example: --test-target 0x000000FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+        #[arg(long)]
+        test_target: Option<String>,
+    },
     /// Demo: subscribe to challenge updates and print them. No mining, no submitting.
     ChainWatch {
         /// WebSocket or HTTP RPC endpoint URL
@@ -55,8 +64,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    match cli.cmd.unwrap_or(Cmd::Run) {
-        Cmd::Run => run(cli.config).await,
+    match cli.cmd.unwrap_or(Cmd::Run { test_target: None }) {
+        Cmd::Run { test_target } => {
+            let parsed = match test_target {
+                None => None,
+                Some(s) => {
+                    let cleaned = s.trim_start_matches("0x");
+                    let v = alloy::primitives::U256::from_str_radix(cleaned, 16)
+                        .map_err(|e| anyhow::anyhow!("--test-target hex parse: {e}"))?;
+                    tracing::warn!(
+                        "TEST MODE: overriding on-chain target with {:#x}. Submitted txs will revert with InsufficientWork.",
+                        v
+                    );
+                    Some(v)
+                }
+            };
+            run(cli.config, parsed).await
+        }
         Cmd::ChainWatch { rpc, miner } => chain_watch(&rpc, miner.parse()?).await,
         Cmd::ImportKey { out, name } => import_key(out, name.as_deref()).await,
     }
@@ -109,7 +133,10 @@ async fn import_key(out: PathBuf, name: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(config_path: PathBuf) -> anyhow::Result<()> {
+async fn run(
+    config_path: PathBuf,
+    test_target_override: Option<alloy::primitives::U256>,
+) -> anyhow::Result<()> {
     let cfg = Config::load(&config_path)
         .map_err(|e| anyhow::anyhow!("failed to load config {:?}: {}", config_path, e))?;
 
@@ -175,6 +202,7 @@ async fn run(config_path: PathBuf) -> anyhow::Result<()> {
             // read of borrow() here the kernel would run with target=0 (no hits possible)
             // until the next epoch change, ~20 minutes away.
             let initial = rx.borrow_and_update().clone();
+            let effective_target = test_target_override.unwrap_or(initial.target);
             tracing::info!(
                 epoch = initial.epoch,
                 block = initial.block_number,
@@ -182,12 +210,12 @@ async fn run(config_path: PathBuf) -> anyhow::Result<()> {
                 "initial challenge → grinder"
             );
             let _ = grinder
-                .hot_swap(initial.challenge, initial.target, initial.epoch)
+                .hot_swap(initial.challenge, effective_target, initial.epoch)
                 .await;
             metrics.emit(Event::EpochSwap {
                 epoch: initial.epoch,
                 block: initial.block_number,
-                diff: format!("{:#x}", initial.target),
+                diff: format!("{:#x}", effective_target),
                 challenge: format!("{}", initial.challenge),
                 latency_ms: 0,
             });
@@ -197,11 +225,12 @@ async fn run(config_path: PathBuf) -> anyhow::Result<()> {
                     break;
                 }
                 let u = rx.borrow_and_update().clone();
-                let _ = grinder.hot_swap(u.challenge, u.target, u.epoch).await;
+                let effective_target = test_target_override.unwrap_or(u.target);
+                let _ = grinder.hot_swap(u.challenge, effective_target, u.epoch).await;
                 metrics.emit(Event::EpochSwap {
                     epoch: u.epoch,
                     block: u.block_number,
-                    diff: format!("{:#x}", u.target),
+                    diff: format!("{:#x}", effective_target),
                     challenge: format!("{}", u.challenge),
                     latency_ms: 0,
                 });
