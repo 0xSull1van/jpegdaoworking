@@ -46,7 +46,12 @@ struct HitRaw {
 
 pub struct GpuRuntime {
     pub context: Arc<CudaContext>,
+    /// Control stream — used for all host↔device memcpy. Does NOT block behind the
+    /// persistent kernel. Must be separate from compute_stream.
     pub stream: Arc<CudaStream>,
+    /// Dedicated stream for the persistent grind kernel. The kernel may run forever;
+    /// queueing memcpy on this stream would deadlock waiting for the kernel to finish.
+    compute_stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
     grind_fn: CudaFunction,
     /// Host mirror of which double-buffer slot is live on the device.
@@ -72,10 +77,14 @@ impl GpuRuntime {
             .map_err(|e| MinerError::Gpu(format!("load_function(grind): {e:?}")))?;
 
         let stream = context.default_stream();
+        let compute_stream = context
+            .new_stream()
+            .map_err(|e| MinerError::Gpu(format!("new_stream(compute): {e:?}")))?;
 
         Ok(Self {
             context,
             stream,
+            compute_stream,
             module,
             grind_fn,
             active_idx_host: 0,
@@ -170,6 +179,12 @@ impl GpuRuntime {
         }
 
         self.active_idx_host = next;
+        // Ensure all writes to constant memory + d_active_idx are committed before
+        // returning. Without this, a subsequent launch_persistent on compute_stream
+        // could start the kernel before the writes land on device.
+        self.stream
+            .synchronize()
+            .map_err(|e| MinerError::Gpu(format!("hot_swap sync: {e:?}")))?;
         Ok(())
     }
 
@@ -185,9 +200,11 @@ impl GpuRuntime {
             .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e:?}")))
     }
 
-    /// Launch the persistent `grind` kernel asynchronously.
+    /// Launch the persistent `grind` kernel asynchronously on the compute stream.
     ///
-    /// The kernel runs until `d_should_stop` is set to 1.
+    /// The kernel runs until `d_should_stop` is set to 1. Critically, the kernel
+    /// is queued on `compute_stream` (NOT the default/control stream) so that
+    /// subsequent control-stream memcpy operations do not block waiting for it.
     pub fn launch_persistent(&self, blocks: u32, threads: u32) -> Result<()> {
         let cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
@@ -195,7 +212,7 @@ impl GpuRuntime {
             shared_mem_bytes: 0,
         };
         unsafe {
-            self.stream
+            self.compute_stream
                 .launch_builder(&self.grind_fn)
                 .launch(cfg)
                 .map_err(|e| MinerError::Gpu(format!("launch grind: {e:?}")))?;
