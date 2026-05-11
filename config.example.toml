@@ -20,10 +20,10 @@ confirmations = 2
 [gpu]
 device_id         = 0
 threads_per_block = 256
-blocks_per_sm     = 4
-batch_per_thread  = 1024
+blocks_per_sm     = 4      # 34 × 4 = 136 blocks × 256 threads = 34,816 concurrent grinders
+batch_per_thread  = 1024   # each thread processes 1024 nonces per outer iter (~10ms per batch on 4060 Ti)
 poll_interval_ms  = 50
-sm_count          = 128   # RTX 4090 = 128, 4080 = 76, 4070 Ti = 60, 3090 = 82, 3080 = 68
+sm_count          = 34     # RTX 4060 Ti 16GB (AD106). Other Ada: 4090=128, 4080=76, 4070 Ti=60, 4070=46. Ampere: 3090=82, 3080=68.
 
 [metrics]
 jsonl_path = "./logs/metrics.jsonl"
