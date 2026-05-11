@@ -57,7 +57,7 @@ impl GpuRuntime {
     /// Initialise context, load PTX, resolve kernel function.
     pub fn init(device_id: u32) -> Result<Self> {
         let context = CudaContext::new(device_id as usize)
-            .map_err(|e| MinerError::Gpu(format!("CudaContext::new: {e}")))?;
+            .map_err(|e| MinerError::Gpu(format!("CudaContext::new: {e:?}")))?;
 
         // PTX bytes are a UTF-8 null-terminated string produced by nvcc.
         let ptx_str = std::str::from_utf8(PTX)
@@ -65,11 +65,11 @@ impl GpuRuntime {
 
         let module: Arc<CudaModule> = context
             .load_module(Ptx::from_src(ptx_str))
-            .map_err(|e| MinerError::Gpu(format!("load_module: {e}")))?;
+            .map_err(|e| MinerError::Gpu(format!("load_module: {e:?}")))?;
 
         let grind_fn: CudaFunction = module
             .load_function("grind")
-            .map_err(|e| MinerError::Gpu(format!("load_function(grind): {e}")))?;
+            .map_err(|e| MinerError::Gpu(format!("load_function(grind): {e:?}")))?;
 
         let stream = context.default_stream();
 
@@ -112,61 +112,61 @@ impl GpuRuntime {
             let mut sym = self
                 .module
                 .get_global("c_challenge", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(c_challenge): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(c_challenge): {e:?}")))?;
             let mut slot = sym
                 .try_slice_mut(slot_off_32..slot_off_32 + 32)
                 .ok_or_else(|| MinerError::Gpu("c_challenge slice OOB".into()))?;
             self.stream
                 .memcpy_htod(&challenge_bytes, &mut slot)
-                .map_err(|e| MinerError::Gpu(format!("htod c_challenge: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod c_challenge: {e:?}")))?;
         }
         // c_target[next] = target (as bytes)
         {
             let mut sym = self
                 .module
                 .get_global("c_target", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(c_target): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(c_target): {e:?}")))?;
             let mut slot = sym
                 .try_slice_mut(slot_off_32..slot_off_32 + 32)
                 .ok_or_else(|| MinerError::Gpu("c_target slice OOB".into()))?;
             self.stream
                 .memcpy_htod(&target_words_bytes, &mut slot)
-                .map_err(|e| MinerError::Gpu(format!("htod c_target: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod c_target: {e:?}")))?;
         }
         // c_epoch_id[next] = epoch_id
         {
             let mut sym = self
                 .module
                 .get_global("c_epoch_id", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(c_epoch_id): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(c_epoch_id): {e:?}")))?;
             let mut slot = sym
                 .try_slice_mut(slot_off_4..slot_off_4 + 4)
                 .ok_or_else(|| MinerError::Gpu("c_epoch_id slice OOB".into()))?;
             self.stream
                 .memcpy_htod(&epoch_bytes, &mut slot)
-                .map_err(|e| MinerError::Gpu(format!("htod c_epoch_id: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod c_epoch_id: {e:?}")))?;
         }
         // flip active index
         {
             let mut sym = self
                 .module
                 .get_global("d_active_idx", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_active_idx): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_active_idx): {e:?}")))?;
             let next_bytes: [u8; 4] = next.to_ne_bytes();
             self.stream
                 .memcpy_htod(&next_bytes, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_active_idx: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod d_active_idx: {e:?}")))?;
         }
         // reset hit counter (nonce counter is intentionally left alone)
         {
             let mut sym = self
                 .module
                 .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e:?}")))?;
             let zero: [u8; 4] = 0u32.to_ne_bytes();
             self.stream
                 .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count: {e:?}")))?;
         }
 
         self.active_idx_host = next;
@@ -178,11 +178,11 @@ impl GpuRuntime {
         let mut sym = self
             .module
             .get_global("d_should_stop", &self.stream)
-            .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e}")))?;
+            .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e:?}")))?;
         let one: [u8; 4] = 1u32.to_ne_bytes();
         self.stream
             .memcpy_htod(&one, &mut sym)
-            .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e}")))
+            .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e:?}")))
     }
 
     /// Launch the persistent `grind` kernel asynchronously.
@@ -198,7 +198,7 @@ impl GpuRuntime {
             self.stream
                 .launch_builder(&self.grind_fn)
                 .launch(cfg)
-                .map_err(|e| MinerError::Gpu(format!("launch grind: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("launch grind: {e:?}")))?;
         }
         Ok(())
     }
@@ -209,11 +209,11 @@ impl GpuRuntime {
             let sym = self
                 .module
                 .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e:?}")))?;
             let mut buf = [0u8; 4];
             self.stream
                 .memcpy_dtoh(&sym, &mut buf)
-                .map_err(|e| MinerError::Gpu(format!("dtoh d_hit_count: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("dtoh d_hit_count: {e:?}")))?;
             u32::from_ne_bytes(buf)
         };
         if count == 0 {
@@ -227,14 +227,14 @@ impl GpuRuntime {
             let sym = self
                 .module
                 .get_global("d_hits", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hits): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_hits): {e:?}")))?;
             let view = sym
                 .try_slice(..byte_len)
                 .ok_or_else(|| MinerError::Gpu("d_hits slice OOB".into()))?;
             let mut buf = vec![0u8; byte_len];
             self.stream
                 .memcpy_dtoh(&view, &mut buf)
-                .map_err(|e| MinerError::Gpu(format!("dtoh d_hits: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("dtoh d_hits: {e:?}")))?;
             buf
         };
 
@@ -243,11 +243,11 @@ impl GpuRuntime {
             let mut sym = self
                 .module
                 .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count) reset: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count) reset: {e:?}")))?;
             let zero: [u8; 4] = 0u32.to_ne_bytes();
             self.stream
                 .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e:?}")))?;
         }
 
         // SAFETY: HitRaw is repr(C); all fields are plain integer arrays.
@@ -277,11 +277,11 @@ impl GpuRuntime {
         let sym = self
             .module
             .get_global("d_nonce_counter", &self.stream)
-            .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e}")))?;
+            .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e:?}")))?;
         let mut buf = [0u8; 8];
         self.stream
             .memcpy_dtoh(&sym, &mut buf)
-            .map_err(|e| MinerError::Gpu(format!("dtoh d_nonce_counter: {e}")))?;
+            .map_err(|e| MinerError::Gpu(format!("dtoh d_nonce_counter: {e:?}")))?;
         Ok(u64::from_ne_bytes(buf))
     }
 
@@ -296,33 +296,33 @@ impl GpuRuntime {
             let mut sym = self
                 .module
                 .get_global("d_should_stop", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e:?}")))?;
             let zero: [u8; 4] = 0u32.to_ne_bytes();
             self.stream
                 .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e:?}")))?;
         }
         // Reset d_hit_count = 0
         {
             let mut sym = self
                 .module
                 .get_global("d_hit_count", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e:?}")))?;
             let zero: [u8; 4] = 0u32.to_ne_bytes();
             self.stream
                 .memcpy_htod(&zero, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e:?}")))?;
         }
         // Set d_nonce_counter = counter
         {
             let mut sym = self
                 .module
                 .get_global("d_nonce_counter", &self.stream)
-                .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e:?}")))?;
             let bytes: [u8; 8] = counter.to_ne_bytes();
             self.stream
                 .memcpy_htod(&bytes, &mut sym)
-                .map_err(|e| MinerError::Gpu(format!("htod d_nonce_counter: {e}")))?;
+                .map_err(|e| MinerError::Gpu(format!("htod d_nonce_counter: {e:?}")))?;
         }
         // Launch 1 block × 1 thread; kernel will grind its batch then check stop flag.
         self.launch_persistent(1, 1)?;
