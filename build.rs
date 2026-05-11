@@ -40,6 +40,15 @@ fn main() {
     let maxreg = std::env::var("CUDA_MAXREG").unwrap_or_else(|_| "auto".to_string());
     println!("cargo:rerun-if-env-changed=CUDA_MAXREG");
 
+    // BATCH_PER_THREAD — nonces processed per thread between atomicAdd to d_nonce_counter.
+    // Default 8192. Higher = less atomic overhead, more register state held longer.
+    //   CUDA_BATCH=4096   → 4K nonces/thread (lower-end GPUs, fewer threads, smaller batches)
+    //   CUDA_BATCH=8192   → default (good for most cards)
+    //   CUDA_BATCH=16384  → 16K (5090, 4090 - amortize atomics over more work)
+    //   CUDA_BATCH=32768  → 32K (Vast.ai 5090 if pipeline runs many seconds w/o stop check)
+    let batch = std::env::var("CUDA_BATCH").unwrap_or_else(|_| "8192".to_string());
+    println!("cargo:rerun-if-env-changed=CUDA_BATCH");
+
     let mut args: Vec<String> = vec![
         "-ptx".into(),
         "-O3".into(),
@@ -47,6 +56,7 @@ fn main() {
         "-Xptxas".into(), "-O3".into(),
         "-Xptxas".into(), "-v".into(),
         "--use_fast_math".into(),
+        format!("-DBATCH_PER_THREAD={}", batch),
     ];
     if maxreg != "auto" {
         args.push(format!("--maxrregcount={}", maxreg));
