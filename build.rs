@@ -30,11 +30,14 @@ fn main() {
 
     // Register cap — configurable via CUDA_MAXREG env var.
     //   CUDA_MAXREG=64       → tight, max occupancy, may spill
-    //   CUDA_MAXREG=80       → previous default
+    //   CUDA_MAXREG=80       → previous default (kept available)
     //   CUDA_MAXREG=128      → loose, may reduce occupancy but no spill
-    //   CUDA_MAXREG=auto     → no cap, let compiler decide
-    //   (unset)              → default 80
-    let maxreg = std::env::var("CUDA_MAXREG").unwrap_or_else(|_| "80".to_string());
+    //   CUDA_MAXREG=auto     → no cap, let compiler decide (DEFAULT)
+    //   (unset)              → auto (no cap)
+    //
+    // The named-state Keccak kernel needs ~100+ live 32-bit registers; capping
+    // at 80 caused spills and degraded throughput. `auto` lets nvcc pick.
+    let maxreg = std::env::var("CUDA_MAXREG").unwrap_or_else(|_| "auto".to_string());
     println!("cargo:rerun-if-env-changed=CUDA_MAXREG");
 
     let mut args: Vec<String> = vec![
