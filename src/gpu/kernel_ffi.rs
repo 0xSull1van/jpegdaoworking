@@ -284,4 +284,64 @@ impl GpuRuntime {
             .map_err(|e| MinerError::Gpu(format!("dtoh d_nonce_counter: {e}")))?;
         Ok(u64::from_ne_bytes(buf))
     }
+
+    /// Test helper: pre-seed `d_nonce_counter` so the next batch starts at `nonce.low_u64()`,
+    /// resets stop/hit flags, then launches a 1-block × 1-thread grid.
+    /// The kernel will grind BATCH_PER_THREAD nonces from that starting point then exit.
+    pub fn force_test_nonce(&mut self, nonce: U256) -> Result<()> {
+        let counter: u64 = u64::try_from(nonce).unwrap_or(u64::MAX);
+
+        // Reset d_should_stop = 0
+        {
+            let mut sym = self
+                .module
+                .get_global("d_should_stop", &self.stream)
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_should_stop): {e}")))?;
+            let zero: [u8; 4] = 0u32.to_ne_bytes();
+            self.stream
+                .memcpy_htod(&zero, &mut sym)
+                .map_err(|e| MinerError::Gpu(format!("htod d_should_stop: {e}")))?;
+        }
+        // Reset d_hit_count = 0
+        {
+            let mut sym = self
+                .module
+                .get_global("d_hit_count", &self.stream)
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_hit_count): {e}")))?;
+            let zero: [u8; 4] = 0u32.to_ne_bytes();
+            self.stream
+                .memcpy_htod(&zero, &mut sym)
+                .map_err(|e| MinerError::Gpu(format!("htod d_hit_count reset: {e}")))?;
+        }
+        // Set d_nonce_counter = counter
+        {
+            let mut sym = self
+                .module
+                .get_global("d_nonce_counter", &self.stream)
+                .map_err(|e| MinerError::Gpu(format!("get_global(d_nonce_counter): {e}")))?;
+            let bytes: [u8; 8] = counter.to_ne_bytes();
+            self.stream
+                .memcpy_htod(&bytes, &mut sym)
+                .map_err(|e| MinerError::Gpu(format!("htod d_nonce_counter: {e}")))?;
+        }
+        // Launch 1 block × 1 thread; kernel will grind its batch then check stop flag.
+        self.launch_persistent(1, 1)?;
+        // Signal stop so kernel exits after its first batch.
+        self.signal_stop()
+    }
+
+    /// Blocking poll: retry `poll_hits` until at least one hit is returned or `timeout` elapses.
+    pub fn poll_hits_blocking(&mut self, timeout: std::time::Duration) -> Result<Vec<Hit>> {
+        let start = std::time::Instant::now();
+        loop {
+            let hits = self.poll_hits()?;
+            if !hits.is_empty() {
+                return Ok(hits);
+            }
+            if start.elapsed() >= timeout {
+                return Ok(Vec::new());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 }

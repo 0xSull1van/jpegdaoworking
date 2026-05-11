@@ -47,3 +47,7 @@ rand = "0.8"
 [[bin]]
 name = "hashminer"
 path = "src/main.rs"
+
+[[bin]]
+name = "hashminer-bench"
+path = "bin/hashminer-bench.rs"
