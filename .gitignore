@@ -1,0 +1,10 @@
+/target
+/Cargo.lock                           # binary crate, keep lock — actually we DO want it for reproducible mining builds
+!/Cargo.lock
+/logs
+/keys
+/config.toml                          # user secrets
+.env
+*.swp
+docs/superpowers/specs/_etherscan_source.json
+docs/superpowers/specs/_sourcify.json
