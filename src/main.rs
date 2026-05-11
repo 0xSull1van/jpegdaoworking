@@ -169,11 +169,34 @@ async fn run(config_path: PathBuf) -> anyhow::Result<()> {
         let mut rx = watcher.subscribe(signer.address());
         let metrics = metrics.clone();
         tokio::spawn(async move {
+            // CRITICAL: tokio::watch does NOT notify subscribers about the initial channel
+            // value — only about subsequent send()s. The watcher publishes the initial
+            // challenge at creation time (before main subscribes); without an explicit
+            // read of borrow() here the kernel would run with target=0 (no hits possible)
+            // until the next epoch change, ~20 minutes away.
+            let initial = rx.borrow_and_update().clone();
+            tracing::info!(
+                epoch = initial.epoch,
+                block = initial.block_number,
+                challenge = %initial.challenge,
+                "initial challenge → grinder"
+            );
+            let _ = grinder
+                .hot_swap(initial.challenge, initial.target, initial.epoch)
+                .await;
+            metrics.emit(Event::EpochSwap {
+                epoch: initial.epoch,
+                block: initial.block_number,
+                diff: format!("{:#x}", initial.target),
+                challenge: format!("{}", initial.challenge),
+                latency_ms: 0,
+            });
+
             loop {
                 if rx.changed().await.is_err() {
                     break;
                 }
-                let u = rx.borrow().clone();
+                let u = rx.borrow_and_update().clone();
                 let _ = grinder.hot_swap(u.challenge, u.target, u.epoch).await;
                 metrics.emit(Event::EpochSwap {
                     epoch: u.epoch,
