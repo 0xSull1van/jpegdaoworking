@@ -20,11 +20,19 @@ fn main() {
         panic!("nvcc not in PATH; install CUDA toolkit or build without --features cuda-runtime")
     });
 
+    // PTX virtual arch. Default = compute_89 (Ada Lovelace, RTX 40-series).
+    // Override via `CUDA_ARCH=compute_120 cargo build ...` for native Blackwell (RTX 5090).
+    // PTX is forward-compatible: compute_89 PTX runs on Hopper/Blackwell via driver JIT,
+    // but native arch gives ~5-10% better throughput.
+    let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "compute_89".to_string());
+    let arch_flag = format!("-arch={}", arch);
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+
     let output = Command::new(&nvcc)
         .args([
             "-ptx",
             "-O3",
-            "-arch=compute_89",       // Ada Lovelace (RTX 40-series)
+            &arch_flag,
             "-Xptxas", "-O3",         // aggressive backend (PTX→SASS) optimization
             "-Xptxas", "-v",          // log register/spill counts for tuning visibility
             "--use_fast_math",        // FP optimizations
