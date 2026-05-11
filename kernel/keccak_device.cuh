@@ -10,8 +10,23 @@ __constant__ uint64_t RC[24] = {
     0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
 };
 
+// Rotate-left 64 bits using native 32-bit funnel shift.
+// On Ada Lovelace SHF.L is 2-cycle vs ~9 cycles for emulated 64-bit shifts.
+// All call sites pass a compile-time constant `n` so branches fold to one path.
 __device__ __forceinline__ uint64_t ROL64(uint64_t x, uint32_t n) {
-    return (x << n) | (x >> (64u - n));
+    uint32_t lo = static_cast<uint32_t>(x);
+    uint32_t hi = static_cast<uint32_t>(x >> 32);
+    uint32_t new_hi, new_lo;
+    if (n >= 32u) {
+        uint32_t m = n - 32u;
+        // After 32-bit half-swap, rotation by m within 32 bits.
+        new_hi = __funnelshift_l(hi, lo, m);
+        new_lo = __funnelshift_l(lo, hi, m);
+    } else {
+        new_hi = __funnelshift_l(lo, hi, n);
+        new_lo = __funnelshift_l(hi, lo, n);
+    }
+    return (static_cast<uint64_t>(new_hi) << 32) | static_cast<uint64_t>(new_lo);
 }
 
 __device__ __forceinline__ void keccak_f1600(uint64_t s[25]) {

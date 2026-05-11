@@ -21,7 +21,15 @@ fn main() {
     });
 
     let status = Command::new(&nvcc)
-        .args(["-ptx", "-O3", "-arch=compute_89"])
+        .args([
+            "-ptx",
+            "-O3",
+            "-arch=compute_89",       // Ada Lovelace (RTX 40-series)
+            "-Xptxas", "-O3",         // aggressive backend (PTX→SASS) optimization
+            "-Xptxas", "-v",          // log register/spill counts for tuning visibility
+            "--use_fast_math",        // FP optimizations (no-op for our integer kernel, but enables some int folding too)
+            "--maxrregcount=80",      // cap registers so more blocks fit per SM (occupancy)
+        ])
         .arg("-o")
         .arg(&out)
         .arg(&kernel)

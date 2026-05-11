@@ -7,15 +7,16 @@
 // (Solidity treats hash as bytes32, "less than target" big-endian),
 // we byte-swap each word.
 
+// Byte-swap a 64-bit value via PRMT (1-cycle byte permute on Ada Lovelace).
+// __byte_perm(a, b, ctrl): result byte k = byte (ctrl>>(4k)&0xF) of {a, b}
+// where a contributes bytes 0..3 and b contributes 4..7.
+// ctrl = 0x0123 → result = bytes [3,2,1,0] of `a` = byte-reversed a.
 __device__ __forceinline__ uint64_t bswap64(uint64_t x) {
-    return ((x & 0x00000000000000FFULL) << 56)
-         | ((x & 0x000000000000FF00ULL) << 40)
-         | ((x & 0x0000000000FF0000ULL) << 24)
-         | ((x & 0x00000000FF000000ULL) <<  8)
-         | ((x & 0x000000FF00000000ULL) >>  8)
-         | ((x & 0x0000FF0000000000ULL) >> 24)
-         | ((x & 0x00FF000000000000ULL) >> 40)
-         | ((x & 0xFF00000000000000ULL) >> 56);
+    uint32_t lo = static_cast<uint32_t>(x);
+    uint32_t hi = static_cast<uint32_t>(x >> 32);
+    uint32_t new_lo = __byte_perm(hi, 0u, 0x0123u);  // reverse high half → low
+    uint32_t new_hi = __byte_perm(lo, 0u, 0x0123u);  // reverse low half  → high
+    return (static_cast<uint64_t>(new_hi) << 32) | static_cast<uint64_t>(new_lo);
 }
 
 __device__ __forceinline__ bool less_than_target_be(const uint64_t state[25], const uint64_t target[4]) {
