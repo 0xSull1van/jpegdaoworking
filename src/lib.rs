@@ -5,3 +5,4 @@ pub mod rpc;
 pub mod chain;
 pub mod gpu;
 pub mod tx;
+pub mod wallet;

@@ -27,6 +27,7 @@ zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
 thiserror = "1"
 anyhow = "1"
+rpassword = "7"
 async-trait = "0.1"
 url = "2"
 parking_lot = "0.12"
@@ -40,6 +41,7 @@ wiremock = "0.6"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+rand = "0.8"
 
 [[bin]]
 name = "hashminer"
